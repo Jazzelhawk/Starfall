@@ -16,6 +16,17 @@ SF.Editor = {}
 
 if CLIENT then
 
+	local invalid_filename_chars = {
+		["*"] = "",
+		["?"] = "",
+		[">"] = "",
+		["<"] = "",
+		["|"] = "",
+		["\\"] = "",
+		['"'] = "",
+		[" "] = "_",
+	}
+
 	local keywords = {
 		["if"] = true,
 		["elseif"] = true,
@@ -304,6 +315,58 @@ if CLIENT then
 			end
 		end
 
+		function SF.Editor.editor:SaveFile( Line, close, SaveAs )
+			self:ExtractName( )
+			if close and self.chip then
+				if not self:Validate( true ) then return end
+				net.Start( "starfall_uploadandexit" )
+					net.WriteEntity( self.chip ) 
+				net.SendToServer( )
+				self:Close( )
+				return
+			end
+			if not Line or SaveAs or Line == self.Location .. "/" .. ".txt" then
+				local str
+				if self.C[ 'Browser' ].panel.File then
+					str = self.C[ 'Browser' ].panel.File.FileDir -- Get FileDir
+					if str and str ~= "" then -- Check if not nil
+						-- Remove "expression2/" or "cpuchip/" etc
+						local n, _ = str:find( "/", 1, true )
+						str = str:sub( n + 1, -1 )
+
+						if str and str ~= "" then -- Check if not nil
+							if str:Right( 4 ) == ".txt" then -- If it's a file
+								str = string.GetPathFromFilename( str ):Left( -2 ) -- Get the file path instead
+								if not str or str == "" then
+									str = nil
+								end
+							end
+						else
+							str = nil
+						end
+					else
+						str = nil
+					end
+				end
+				Derma_StringRequestNoBlur( "Save to New File", "", ( str ~= nil and str .. "/" or "" ) .. self.savefilefn,
+					function( strTextOut )
+						strTextOut = string.gsub( strTextOut, ".", invalid_filename_chars )
+						self:SaveFile( self.Location .. "/" .. strTextOut .. ".txt", close )
+					end )
+				return
+			end
+
+			file.Write( Line, self:GetCode( ) )
+
+			local panel = self.C[ 'Val' ].panel
+			timer.Simple( 0, function( ) panel.SetText( panel, "   Saved as " .. Line ) end )
+
+			if not self.chip then self:ChosenFile( Line ) end
+			if close then
+				SF.AddNotify( LocalPlayer(), "Starfall code saved as " .. Line .. ".", NOTIFY_GENERIC, 7, NOTIFYSOUND_DRIP3 )
+				self:Close( )
+			end
+		end
 
 		SF.Editor.editor:Setup("SF Editor", "starfall", "nothing") -- Setting the editor type to not nil keeps the validator line
 		
@@ -377,6 +440,7 @@ if CLIENT then
 				self.C['Val'].panel:SetFGColor(255, 255, 255, 128)
 				self.C['Val'].panel:SetText( "   No Syntax Errors" )
 			end
+			return true
 		end
 	end
 	
@@ -411,9 +475,20 @@ if CLIENT then
 	-- @return True if ok, false if a file was missing
 	-- @return A table with mainfile = codename and files = a table of filenames and their contents, or the missing file path.
 	function SF.Editor.BuildIncludesTable(maincode, codename)
+
+		local currentEditor = SF.Editor.editor:GetCurrentEditor()
+		local currentIncludes = nil
+		if not ( maincode or codename ) then
+			currentIncludes = currentEditor.includes
+		end
+		if currentIncludes then
+			local list = currentEditor.includeswindow.list
+			currentEditor.includes[ list:GetLine( list:GetSelectedLine() ):GetColumnText( 1 ) ] = currentEditor:GetValue()
+		end
+
 		local tbl = {}
-		maincode = maincode or SF.Editor.getCode()
-		codename = codename or SF.Editor.getOpenFile() or "main"
+		maincode = maincode or ( currentIncludes and currentIncludes[ currentEditor.mainfile ] ) or SF.Editor.getCode()
+		codename = codename or ( currentIncludes and currentEditor.mainfile ) or SF.Editor.getOpenFile() or "main"
 		tbl.mainfile = codename
 		tbl.files = {}
 		tbl.filecount = 0
@@ -429,6 +504,8 @@ if CLIENT then
 			local code
 			if path == codename and maincode then
 				code = maincode
+			elseif currentIncludes and currentIncludes[path] then
+				code = currentIncludes[path]
 			else
 				code = file.Read("Starfall/"..path, "DATA") or error("Bad include: "..path,0)
 			end
@@ -460,6 +537,61 @@ if CLIENT then
 		end
 	end
 
+	net.Receive( "starfall_download", function( len )
+		local ent = net.ReadEntity()
+		SF.Editor.editor.chip = ent
+		local mainfile = net.ReadTable()[1]
+		local files = net.ReadTable()
+		local editor = SF.Editor.editor
+
+		local function tableEquals( t1, t2 )
+			if not t1 or not t2 then return end
+			for k, v in pairs( t1 ) do
+				if not t2[k] or v ~= t2[k] then
+					return false
+				end
+			end
+			for k, v in pairs( t2 ) do
+				if not t1[k] or v ~= t1[k] then
+					return false
+				end
+			end
+			return true
+		end
+
+		local currentFile = nil
+		local currentCode = nil
+		local index = nil
+		for i = 1, editor:GetNumTabs() do
+			if editor:GetEditor(i):GetValue() == files[ mainfile ] then
+				currentFile = mainfile
+				curreentCode = editor:GetEditor( i ):GetValue()
+				index = i
+				break
+			end
+		end
+
+		if currentFile then
+			local ok, currentFiles = SF.Editor.BuildIncludesTable( currentCode, currentFile )
+			currentFiles = currentFiles.files
+			if ok and tableEquals( currentFiles, files ) then
+				editor:SetActiveTab( index )
+				return
+			end
+		end
+
+		for i = 1, editor:GetNumTabs( ) do
+			if tableEquals( editor:GetEditor( i ).includes, files ) then
+				editor:SetActiveTab( i )
+				return
+			end
+		end
+
+		editor:Open( mainfile, files[ mainfile ], true )
+		local currentEditor = SF.Editor.editor:GetCurrentEditor()
+		createIncludesWindow( currentEditor )
+		currentEditor.includeswindow:Update( mainfile, files, ent )
+	end )
 
 	-- CLIENT ANIMATION
 
@@ -503,6 +635,111 @@ if CLIENT then
 		end
 	end)
 
+	-- INCLUDES WINDOW
+
+	function createIncludesWindow( editor )
+		editor.includeswindow = vgui.Create( "DPanel", editor )
+		editor.includeswindow:SetPos( SF.Editor.editor:GetWide()-236-150, 50 )
+		editor.includeswindow:SetSize( 150, 200 )
+		local r, g, b = GetConVar("wire_expression2_editor_color_fl"):GetString():match("(%d+)_(%d+)_(%d+)")
+		editor.includeswindow:SetBackgroundColor(Color(tonumber(r),tonumber(g),tonumber(b)))
+		editor.includeswindow.open = true
+
+		local window = editor.includeswindow
+
+		local posx, posy = window:GetPos()
+		window.button = vgui.Create( "DImageButton", editor )
+		window.button:SetPos( posx-32, posy+68 )
+		window.button:SetImage( "radon/next.png" )
+		window.button:SizeToContents()
+		window.button.state = "next"
+		window.button.DoClick = function()
+			window.startx = window:GetPos()
+			hook.Add( "Think", "AnimateIncludes", function()
+				local xpos = window:GetPos()
+				if window.open then
+					if window.button.state == "next" then
+						window.button:SetImage( "radon/last.png" )
+						window.button.state = "last"
+					end
+					window:SetPos( xpos + 2, 50 )
+					if ( xpos + 2 ) - window.startx == 150 then
+						hook.Remove( "Think", "AnimateIncludes" )
+						window.open = false
+						window.startx = window:GetPos()
+					end
+				else
+					if window.button.state == "last" then
+						window.button:SetImage( "radon/next.png" )
+						window.button.state = "next"
+					end
+					window:SetPos( xpos - 2, 50 )
+					if window.startx - ( xpos - 2 ) == 150 then
+						hook.Remove( "Think", "AnimateIncludes" )
+						window.open = true
+						window.startx = window:GetPos()
+					end
+				end
+			end )
+		end
+		local lastw, lasth = SF.Editor.editor:GetSize()
+		window.Think = function()
+			local w, h = SF.Editor.editor:GetSize()
+			local changew, changeh = w - lastw, h - lasth
+			window:SetPos( window:GetPos()+changew, 50 )
+			window.button:SetPos( window:GetPos()-32, 118 )
+			lastw, lasth = w, h
+		end
+		function window:Update( mainfile, files, ent )
+			editor.includes = files
+			editor.mainfile = mainfile
+			editor.chosenfile = mainfile--tostring( ent )
+
+			self.list:Clear()
+			local function reverseTable( tbl ) 
+				local r = {}
+				for k, v in pairs( tbl ) do
+					table.insert( r, 1, k )
+				end
+				return r
+			end			
+			local filesToAdd = reverseTable( files )
+			for k, v in pairs( filesToAdd ) do
+				self.list:AddLine( v )
+			end
+			self.list:SelectFirstItem()
+		end
+
+		window.list = vgui.Create( "DListView", window )
+		window.list:SetMultiSelect( false )
+		window.list:AddColumn( "Files" )
+		window.list:SetPos( 6, 6 )
+		window.list:SetSize( 138, 161 )
+		function window.list:OnRowSelected( index, row )
+			local file = row:GetColumnText(1)
+			editor.includes[ editor.chosenfile ] = editor:GetValue()
+			editor.chosenfile = file
+			editor:SetText( editor.includes[ file ] )
+		end
+
+		window.savebutton = vgui.Create( "DButton", window )
+		window.savebutton:SetPos( 6, 172 )
+		window.savebutton:SetSize( 138, 22 )
+		window.savebutton:SetText( "Save files" )
+		window.savebutton.DoClick = function()
+			editor.includes[ window.list:GetLine( window.list:GetSelectedLine() ):GetColumnText( 1 ) ] = editor:GetValue()
+			for k, v in pairs( editor.includes ) do
+				if k == editor.mainfile then
+					file.Write( k, v )
+				else
+					file.Write( SF.Editor.editor.Location .. "/" .. k, v )
+				end
+			end
+			local panel = SF.Editor.editor.C[ 'Val' ].panel
+			timer.Simple( 0, function( ) panel.SetText( panel, "   Files saved" ) end )
+		end
+	end
+
 else
 
 	-- SERVER STUFF HERE
@@ -510,10 +747,14 @@ else
 	-- this might fit better elsewhere
 
 	util.AddNetworkString("starfall_editor_status")
+	util.AddNetworkString("starfall_uploadandexit")
+	util.AddNetworkString("starfall_download")
 
 	resource.AddFile( "materials/radon/starfall2.png" )
 	resource.AddFile( "materials/radon/starfall2.vmt" )
 	resource.AddFile( "materials/radon/starfall2.vtf" )
+	resource.AddFile( "materials/radon/next.png" )
+	resource.AddFile( "materials/radon/last.png" )
 
 	local starfall_event = {}
 
@@ -542,5 +783,28 @@ else
 		net.WriteBit(false)
 		net.Broadcast()
 	end
+
+	net.Receive( "starfall_uploadandexit", function( len, ply ) 
+		ent = net.ReadEntity()
+			
+		--Check cppi or ownership again incase someone manually changes SF.Editor.editor.chip or permissions change
+		if ( CPPI and not ent:CPPICanTool( ply, ent:GetClass() ) ) or ( not CPPI and ply ~= ent.owner ) then 
+			SF.AddNotify( ply, "Cannot upload SF code, permission denied", NOTIFY_ERROR, 7, NOTIFYSOUND_ERROR1 )
+			return 
+		end
+
+		if not SF.RequestCode( ply, function( mainfile, files )
+			if not mainfile then return end
+			if not IsValid( ent ) then return end
+
+			if ent:GetClass() == "starfall_processor" then
+				ent:Compile( files, mainfile )
+			else
+				ent:CodeSent( ply, files, mainfile )
+			end
+		end ) then
+			SF.AddNotify( ply, "Cannot upload SF code, please wait for the current upload to finish.", NOTIFY_ERROR, 7, NOTIFYSOUND_ERROR1 )
+		end
+	end )
 
 end
